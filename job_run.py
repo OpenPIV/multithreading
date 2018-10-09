@@ -14,7 +14,6 @@ import openpiv.gpu_process
 import pycuda
 import pycuda.driver as cuda 
 
-import pycuda.autoinit
 t = time.time()
 print "\n\nStarting Code"
 
@@ -52,8 +51,8 @@ units = ["m", "m", "m/s", "m/s" ]
 header = "x [{}],\ty [{}],\tu [{}],\tv [{}],\tmask ".format(units[0], units[1], units[2], units[3])
 N = 4
   
-def thread_gpu(i, frame_a, frame_b):
-    x,y,u,v,mask = openpiv.gpu_process.WiDIM(frame_a, frame_b, np.ones_like(frame_a, dtype=np.int32),
+def thread_gpu(gpuid, i, frame_a, frame_b):
+    x,y,u,v,mask = openpiv.gpu_process.WiDIM(gpuid, frame_a, frame_b, np.ones_like(frame_a, dtype=np.int32),
                                              min_window_size,
                                              overlap,
                                              coarse_factor,
@@ -86,13 +85,12 @@ class gpuThread(threading.Thread):
     def run(self):
         # REMEMBER TO SET THIS TO # OF DEVICES INSTEAD OF HARDCODING
         self.dev = cuda.Device(self.gpuid%N)
-        self.ctx = self.dev.make_context()
         #self.array_gpu = cuda.mem_alloc(self.frame_a.nbytes + self.frame_b.nbytes)
         
         #self.output_array = np.ones_like(self.frame_a)
 
         #cuda.memcpy_htod(self.array_gpu, self.output_array) 
-        thread_gpu(self.gpuid, self.frame_a, self.frame_b)
+        thread_gpu(self.gpuid%N, self.gpuid, self.frame_a, self.frame_b)
         self.ctx.synchronize()       
         
         print "\nThread %d finished." % self.gpuid
@@ -108,6 +106,6 @@ gpu_thread_list = []
 for i in range(numgpus):
     gpu_thread = gpuThread(i)
     gpu_thread.start()
-    gpu_thread_list.appends(gpu_thread)
+    gpu_thread_list.append(gpu_thread)
 
 print "\nDone Processing data."

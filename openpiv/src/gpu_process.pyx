@@ -1,5 +1,5 @@
 """This module is dedicated to advanced algorithms for PIV image analysis with NVIDIA GPU Support."""
-
+import pycuda.autoinit
 from pycuda.compiler import SourceModule
 import pycuda.gpuarray as gpuarray
 import pycuda.driver as drv
@@ -810,7 +810,8 @@ def get_field_shape ( image_size, window_size, overlap ):
 
 
 ##################################################################
-def WiDIM( np.ndarray[DTYPEi_t, ndim=2] frame_a, 
+def WiDIM( int gpuid,
+           np.ndarray[DTYPEi_t, ndim=2] frame_a, 
            np.ndarray[DTYPEi_t, ndim=2] frame_b,
            np.ndarray[DTYPEi_t, ndim=2] mark,
            int min_window_size,
@@ -976,7 +977,12 @@ def WiDIM( np.ndarray[DTYPEi_t, ndim=2] frame_a,
     
     # initialize scikits-cuda miscilaneous library
     cu_misc.init()
-    
+
+    # select specific gpu
+    drv.init()
+    dev = drv.Device(gpuid)
+    dev.make_context()
+ 
     # cast images as floats
     #TODO  changing dtype in the function definition gave weird errors. Find out how to change function definition to avoid this step.
     cdef np.ndarray[DTYPEf_t, ndim=2] frame_a_f = frame_a.astype(np.float32)
