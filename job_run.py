@@ -83,27 +83,14 @@ class gpuThread(threading.Thread):
         self.frame_b = np.load(imB_list[gpuid]).astype(np.int32)
 
     def run(self):
-        # REMEMBER TO SET THIS TO # OF DEVICES INSTEAD OF HARDCODING
-        self.dev = cuda.Device(self.gpuid%N)
-        #self.array_gpu = cuda.mem_alloc(self.frame_a.nbytes + self.frame_b.nbytes)
-        
-        #self.output_array = np.ones_like(self.frame_a)
-
-        #cuda.memcpy_htod(self.array_gpu, self.output_array) 
         thread_gpu(self.gpuid%N, self.gpuid, self.frame_a, self.frame_b)
-        self.ctx.synchronize()       
         
         print "\nThread %d finished." % self.gpuid
-        self.ctx.pop()
-        del self.array_gpu
-        del self.ctx
 
-# initialize cuda driver
-numgpus = cuda.Device.count()
 
 gpu_thread_list = []
 
-for i in range(numgpus):
+for i in range(4):
     gpu_thread = gpuThread(i)
     gpu_thread.start()
     gpu_thread_list.append(gpu_thread)
