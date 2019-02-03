@@ -1,20 +1,20 @@
 """
 
 Refactored version of job_run.py with multiprocessing.
-We use multiprocessing here because we don't want shared memory,
-which is what happens with python's multithreading.
+We use multiprocessing here because Python doesn't implement multithreading.
 
 """
 
 from __future__ import division
 
-from multiprocessing import Process
+from multiprocessing import Process, Queue
 from time import time
 from skimage import io
 from piv_tools import contrast
 
 import numpy as np
 import os
+import functools
 
 import glob
 import sys
@@ -29,18 +29,106 @@ if sys.version_info[0] == 3:
 if sys.version_info[0] == 2:
     import openpiv.filters
 
-#import traceback
-#import warnings
-#import sys
+# ===================================================================================================================
+# WARNING: File read/close is UNSAFE in multiprocessing applications because multiple
+# threads are accessing &/or writing to the same file. Please remember to use a queue if doing file I/O concurrently
+# ===================================================================================================================
 
-# This function just gives numpy-defined warnings a stack-trace.
-#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+# Timing decorator (function_type being I/O or compute)
+# Note: Must unpack both the dict and the value in this function
 
- #   log = file if hasattr(file,'write') else sys.stderr
-  #  traceback.print_stack(file=log)
-   # log.write(warnings.formatwarning(message, category, filename, lineno, line))
+# To track distribution of runtime in functions using decorators
+runtime_queue = Queue()
 
-#warnings.showwarning = warn_with_traceback
+def measure_runtime_arg(queue, function_type):
+    def measure_runtime(func):
+        @functools.wraps(func) # preserve introspection of wrapped function (now func.__name__ returns func_name and not 'wrap')
+        def wrap(*args, **kwargs):
+            start_time = time()
+            res = func(*args, **kwargs)
+            finish_time = time()
+
+            func_name = func.__name__
+            func_runtime = finish_time - start_time
+
+            # Record relevant information: function name, function time, function type
+            queue.put({'func_name': func_name, 'func_runtime': func_runtime, 'func_type': function_type})
+
+            return res
+        return wrap
+    return measure_runtime
+
+
+def aggregate_runtime_metrics(queue, filename):
+    # total_dict will look like the following after tracking elements in the queue:
+    # {'func_name': {'total_avg/io_avg': <float>,
+    #                'longest': <int>,
+    #                'total/io': <int>},
+    #  'pCompute': <float>,
+    #  'pIO': <float>
+    # }
+    total_dict = {}
+
+    # Toggle this to print each entry into a file, otherwise only add aggregate lines
+    print_all = False
+
+    with open(filename, 'a+') as file:
+        while not queue.empty():
+            element = queue.get()
+            el_func_name = element['func_name']
+            ftype = element['func_type']
+            runtime = element['func_runtime']
+            
+            if el_func_name in total_dict:
+                current_func = total_dict[el_func_name]
+                current_func['count'] += 1
+
+                if ftype in current_func:
+                    current_func[ftype] += runtime
+                else:
+                    current_func[ftype] = runtime
+
+                if runtime > current_func['longest']:
+                    current_func['longest'] = runtime
+            else:
+                total_dict[el_func_name] = {'count': 1, ftype: runtime, 'longest': runtime}
+
+            if print_all:
+                line_string = 'Function: %s, Type: %s, Runtime: %d \n' % (el_func_name, ftype, runtime)
+                file.write(line_string)
+
+        agg = {'total_time': 0, 'io_time': 0}
+
+        for key in total_dict:
+            current_func = total_dict[key]
+            count = current_func['count']
+            ftype = ''
+
+            if key == 'save_files':
+                ftype = 'io'
+                io_time = current_func['io']
+                current_func['io_avg'] = io_time / count
+                agg['io_time'] += io_time
+            else:  
+                ftype = 'total'
+                total_time = current_func['total']
+                current_func['total_avg'] = total_time/count
+                agg['total_time'] += total_time
+
+            line_string = 'Function: %s, Type: %s, Average: %f, Total: %f, Count: %d \n' % (key, ftype, current_func[ftype + '_avg'], total_time, count)
+            file.write(line_string)
+
+        pIO = agg['io_time']/agg['total_time']*100
+        pCompute = 100 - pIO
+
+        total_string = 'Percent Time Computing: %f, Percent Time Reading/Writing Files: %f\n' % (pCompute, pIO)
+        file.write(total_string)
+
+
+
+# ===================================================================================================================
+# MULTIPROCESSING UTILITY CLASSES & FUNCTIONS
+# ===================================================================================================================
 
 # TODO -- separate the functions into separate module
 class MPGPU(Process):
@@ -67,12 +155,12 @@ class MPGPU(Process):
 
         for i in range(self.num_images):
             frame_a, frame_b = self.frame_list_a[i], self.frame_list_b[i]    
-            #try:
-            func(self.start_index + i, frame_a, frame_b, self.properties, gpuid=self.gpuid)
-            #except Exception as e:
-             #   print "\n An exception occurred! %s" % e
-              #  print sys.exc_info()[2].tb_lineno
-               # self.exceptions += 1
+            try:
+                func(self.start_index + i, frame_a, frame_b, self.properties, gpuid=self.gpuid)
+            except Exception as e:
+                print "\n An exception occurred! %s" % e
+                print sys.exc_info()[2].tb_lineno
+                self.exceptions += 1
 
         print "\nProcess %d took %d seconds to finish %d image pairs (%d to %d)!" % (self.process_num,
                                                                                      time() - process_time,
@@ -105,7 +193,7 @@ def parallelize(num_items, num_processes, list_tuple, properties):
         start_index = i*partitions
         subList_A = list_tuple[0][start_index: start_index + partitions]
         subList_B = list_tuple[1][start_index: start_index + partitions]
-        process = MPGPU(i%4, i, start_index, subList_A, subList_B, properties)
+        process = MPGPU(i % 4, i, start_index, subList_A, subList_B, properties)
         process.start()
         process_list.append(process)
 
@@ -117,64 +205,6 @@ def parallelize(num_items, num_processes, list_tuple, properties):
         for process in process_list:
             process.terminate()
             process.join()
-
-
-# ===============================================================================
-# DEFINE VARIABLES FOR DIRECTORIES
-# ===============================================================================
-
-"""
-Could directories be created in the project directory in the scratch directory 
-when the code is run based on what window size is selected? So there would only
-be two directories here for a single window size.
-
-i.e. if the minimum window size is set to 16, then the GPU code would create
-the directory "output_16" for the regular data and "replace_16" for the data 
-where the outliers are replaced
-"""
-
-out16_dir = "multi_16/"
-out32_dir = "output_32/"
-out64_dir = "output_64/"
-rep32_dir = "replace_32/"
-rep64_dir = "rep64_test/"
-# rep64_dir = "replace_64/"
-
-# ===============================================================================
-# Assign which data you want to process
-# ===============================================================================
-
-"""
-This could be made to be based on the minimum window size chosen - the analysis
-directory would be the output directory (output_XX) and the replacement 
-directory would be replace_XX. NOTE that the replacement can happen only after
-the regular output data has been processed. 
-"""
-
-analysis_dir = out64_dir
-rep_dir = rep64_dir
-
-# ===============================================================================
-# Other parameters
-# ===============================================================================
-
-"""
-The mask is created in ImageJ based on the raw images. Therefore, the mask is
-also flipped across the x-axis. Since the data output from the GPU code (in 
-output_XX) is now flipped to the correct orientation, the mask must also be 
-flipped to the correct orientation.
-
-Mask can be placed in the project directory in the scratch directory - copy from
-local machine onto soscip
-"""
-# load the mask so that it is flipped in the correct orientation
-mask = np.load("mask.npy")[::-1, :]
-
-# Some threshold value for replacing spurious vectors
-r_thresh = 2.0
-
-# Number of image pairs / files
-num_files = 5000
 
 
 # ===============================================================================
@@ -305,7 +335,7 @@ def outlier_detection(u, v, r_thresh, mask=None, max_iter=2):
     return (u_out, v_out)
 
 
-# self.start_index + i, frame_a, frame_b, properties, gpuid (named)
+@measure_runtime_arg(queue=runtime_queue, function_type='total')
 def replace_outliers(image_pair_num, u_file, v_file, properties, gpuid=0):
     """
     This function first loads all the output data from the output directory
@@ -329,8 +359,8 @@ def replace_outliers(image_pair_num, u_file, v_file, properties, gpuid=0):
     u_out, v_out = outlier_detection(u, v, r_thresh, mask=mask)
 
     # save to the replacement directory
-    np.save(output_dir + "u_repout_{:05d}.npy".format(image_pair_num), u_out)
-    np.save(output_dir + "v_repout_{:05d}.npy".format(image_pair_num), v_out)
+    save_files(output_dir, "u_repout_{:05d}.npy".format(image_pair_num), u_out)
+    save_files(output_dir, "v_repout_{:05d}.npy".format(image_pair_num), v_out)
 
 
 def interp_mask(mask, data_dir, exp=0, plot=False):
@@ -381,7 +411,7 @@ def interp_mask(mask, data_dir, exp=0, plot=False):
 
     return mask_int
 
-# self.start_index + i, frame_a, frame_b, self.properties, gpuid=self.gpuid
+@measure_runtime_arg(queue=runtime_queue, function_type='total')
 def histogram_adjust(start_index, frame_a_file, frame_b_file, properties, gpuid=0):
     frame_a = np.load(frame_a_file).astype(np.int32)
     frame_b = np.load(frame_b_file).astype(np.int32)
@@ -408,7 +438,6 @@ def histogram_adjust(start_index, frame_a_file, frame_b_file, properties, gpuid=
     file.write(file_string)
     file.write('\n')
 
-    #    np.save(output_dir + "u_repout_{:05d}.npy".format(image_pair_num), u_out)
     folder_prefix = properties['out_dir']
 
     # Save as .tif for easy error checking (manual check via image check), .npy for further calculations
@@ -418,37 +447,32 @@ def histogram_adjust(start_index, frame_a_file, frame_b_file, properties, gpuid=
     tif_path = ''.join([folder_prefix, '_tif/'])
     npy_path = ''.join([folder_prefix, '_npy/'])
 
-    if not os.path.exists(tif_path):
-        os.makedirs(tif_path)
-
-    if not os.path.exists(npy_path):
-        os.makedirs(npy_path)
-
     tif_file_A = ''.join([outname_A, '.tif'])
     tif_file_B = ''.join([outname_B, '.tif'])
     npy_file_A = ''.join([outname_A, '.npy'])
     npy_file_B = ''.join([outname_B, '.npy'])
 
-    io.imsave(tif_path + tif_file_A, frame_a)
-    io.imsave(tif_path + tif_file_B, frame_b)
-    np.save(npy_path + npy_file_A, frame_a)
-    np.save(npy_path + npy_file_B, frame_b)
+    save_files(tif_path, tif_file_A, frame_a)
+    save_files(tif_path, tif_file_B, frame_b)
+    save_files(npy_path, npy_file_A, frame_a)
+    save_files(npy_path, npy_file_B, frame_b)
 
 
+@measure_runtime_arg(queue=runtime_queue, function_type='total')
 def widim_gpu(start_index, frame_a_file, frame_b_file, properties, gpuid=0):
 
     # TODO -- Decouple these parameters from the functions below and pass them in
     # ==================================================================
     # PARAMETERS FOR OPENPIV
     # ==================================================================
-    dt = 5e-6
-    min_window_size = 16
-    overlap = 0.50
-    coarse_factor = 2
-    nb_iter_max = 3
-    validation_iter = 1
-    x_scale = 7.45e-6  # m/pixel
-    y_scale = 7.41e-6  # m/pixel
+    dt = properties["dt"]
+    min_window_size = properties["min_window_size"]
+    overlap = properties["overlap"]
+    coarse_factor = properties["coarse_factor"]
+    nb_iter_max = properties["nb_iter_max"]
+    validation_iter = properties["validation_iter"]
+    x_scale = properties["x_scale"]  # m/pixel
+    y_scale = properties["y_scale"]  # m/pixel
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpuid)
     out_dir = properties["out_dir"]
 
@@ -472,6 +496,10 @@ def widim_gpu(start_index, frame_a_file, frame_b_file, properties, gpuid=0):
         y = y * y_scale
         v = v * y_scale
 
+    # verify the directory exists:
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
     # save the data
     if start_index == 0:
         np.save(out_dir + "x.npy", x)
@@ -479,8 +507,20 @@ def widim_gpu(start_index, frame_a_file, frame_b_file, properties, gpuid=0):
 
     # Note: we're reversing u and v here only because the camera input is inverted. If the camera ever takes
     # images in the correct orientations, we'll have to remove u[::-1, :].
-    np.save(out_dir + "u_{:05}.npy".format(start_index), u[::-1, :])
-    np.save(out_dir + "v_{:05}.npy".format(start_index), v[::-1, :])
+    save_files(out_dir, "u_{:05}.npy".format(start_index), u[::-1, :])
+    save_files(out_dir, "v_{:05}.npy".format(start_index), v[::-1, :])
+
+
+# ===================================================================================================================
+# FILE READ/SAVE UTILITY & MISC
+# ===================================================================================================================
+
+@measure_runtime_arg(queue=runtime_queue, function_type='io')
+def save_files(out_dir, file_name, file_list):
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    np.save(out_dir + file_name, file_list)
 
 
 def get_input_files(directory, file_name_pattern):
@@ -498,7 +538,8 @@ def get_input_files(directory, file_name_pattern):
         file_list = sorted(glob.glob(directory + file_name_pattern))
 
     return file_list
-        
+
+
 def tif_to_npy(out_dir, prefix, file_list):
     for i in range(len(file_list)):
         file_read = io.imread(file_list[i])
@@ -507,17 +548,34 @@ def tif_to_npy(out_dir, prefix, file_list):
 
 if __name__ == "__main__":
 
+    # ===============================================================================
+    # DEFINE PIV & DIRECTORY VARIABLES HERE
+    # ===============================================================================
+
+    dt = 5e-6
+    min_window_size = 16
+    overlap = 0.50
+    coarse_factor = 2
+    nb_iter_max = 3
+    validation_iter = 1
+    x_scale = 7.45e-6  # m/pixel
+    y_scale = 7.41e-6  # m/pixel
+
+    # load the mask so that it is flipped in the correct orientation
+    mask = np.load("mask.npy")[::-1, :]
+
+    # Some threshold value for replacing spurious vectors
+    r_thresh = 2.0
+
     # path to input and output directory
     raw_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/raw_data/"
     im_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/PIV_Cont_Output/"
-    out_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/output_data2/"
-    rep_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/replaced_data2/"
+    out_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/output_data"
+    rep_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/replaced_data"
 
-    # make sure path is correct
-    if im_dir[-1] != '/':
-        im_dir = im_dir + '/'
-    if out_dir[-1] != '/':
-        out_dir = out_dir + '/'
+    # make output & replacement directory paths according to window size
+    out_dir += str(min_window_size) + "/"
+    rep_dir += str(min_window_size) + "/"
 
     camera_zero_pattern = "Camera_#0_*.npy"
     camera_one_pattern = "Camera_#1_*.npy"
@@ -527,9 +585,9 @@ if __name__ == "__main__":
     imB_list = get_input_files(raw_dir, camera_one_pattern)
     num_images = len(imB_list)
 
-    # TODO make these configurable
-    num_processes = 20 
-    num_images = 1000  # Remove this if you want to process the entire image set
+    # TODO: do some load testing to determine max # of processes before out of memory (for ~5GB image dataset)
+    num_processes = 20
+    num_images = 20  # Remove this if you want to process the entire image set
 
     # Pre-processing contrast
     contrast_properties = {"gpu_func": histogram_adjust, "out_dir": im_dir}
@@ -541,7 +599,11 @@ if __name__ == "__main__":
     imB_list = sorted(glob.glob(im_dir + camera_one_pattern))
 
     # Processing images
-    widim_properties = {"gpu_func": widim_gpu, "out_dir": out_dir}
+    widim_properties = {"gpu_func": widim_gpu, "out_dir": out_dir, "dt": dt,
+                        "min_window_size": min_window_size, "overlap": overlap,
+                        "coarse_factor": coarse_factor, "nb_iter_max": nb_iter_max,
+                        "validation_iter": validation_iter, "x_scale": x_scale,
+                        "y_scale": y_scale}
     parallelize(num_images, num_processes, (imA_list, imB_list), widim_properties)
 
     # Post-processing
@@ -559,3 +621,5 @@ if __name__ == "__main__":
         "mask": mask_int, "r_thresh": r_thresh
         }
     parallelize(num_images, num_processes, (u_list, v_list), routliers_properties)
+
+    aggregate_runtime_metrics(runtime_queue, 'runtime_metrics.txt')
