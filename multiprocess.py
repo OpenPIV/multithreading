@@ -7,14 +7,18 @@ We use multiprocessing here because Python doesn't implement multithreading.
 
 from __future__ import division
 
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Manager
 from time import time
 from skimage import io
 from piv_tools import contrast
+from datetime import datetime
+
+# TODO: We should really only import functions/classes that we need instead of using wildcard
 
 import numpy as np
 import os
 import functools
+import json
 
 import glob
 import sys
@@ -38,7 +42,8 @@ if sys.version_info[0] == 2:
 # Note: Must unpack both the dict and the value in this function
 
 # To track distribution of runtime in functions using decorators
-runtime_queue = Queue()
+manager = Manager()
+runtime_queue = manager.Queue()
 
 def measure_runtime_arg(queue, function_type):
     def measure_runtime(func):
@@ -53,13 +58,15 @@ def measure_runtime_arg(queue, function_type):
 
             # Record relevant information: function name, function time, function type
             queue.put({'func_name': func_name, 'func_runtime': func_runtime, 'func_type': function_type})
-
             return res
         return wrap
     return measure_runtime
 
 
-def aggregate_runtime_metrics(queue, filename):
+def aggregate_runtime_metrics(queue, num_images, num_processes, filename):
+    # In: multiprocess queue, number of images, number of processes, file to write to
+    # Out: summary object for possible use in plots/graphs/figures
+
     # total_dict will look like the following after tracking elements in the queue:
     # {'func_name': {'total_avg/io_avg': <float>,
     #                'longest': <int>,
@@ -68,20 +75,30 @@ def aggregate_runtime_metrics(queue, filename):
     #  'pIO': <float>
     # }
     total_dict = {}
-
     # Toggle this to print each entry into a file, otherwise only add aggregate lines
     print_all = False
 
     with open(filename, 'a+') as file:
+        # Leave a timestamp & ASCII section header
+        section_header = "========================================\n" + \
+                         str(datetime.utcnow()) + \
+                         "\n========================================\n"
+
+        file.write(section_header)
+
         while not queue.empty():
             element = queue.get()
+            
+            if isinstance(element, str):
+                file.write(element)
+                continue
+
             el_func_name = element['func_name']
             ftype = element['func_type']
             runtime = element['func_runtime']
             
             if el_func_name in total_dict:
                 current_func = total_dict[el_func_name]
-                current_func['count'] += 1
 
                 if ftype in current_func:
                     current_func[ftype] += runtime
@@ -91,7 +108,7 @@ def aggregate_runtime_metrics(queue, filename):
                 if runtime > current_func['longest']:
                     current_func['longest'] = runtime
             else:
-                total_dict[el_func_name] = {'count': 1, ftype: runtime, 'longest': runtime}
+                total_dict[el_func_name] = {ftype: runtime, 'longest': runtime}
 
             if print_all:
                 line_string = 'Function: %s, Type: %s, Runtime: %d \n' % (el_func_name, ftype, runtime)
@@ -99,24 +116,46 @@ def aggregate_runtime_metrics(queue, filename):
 
         agg = {'total_time': 0, 'io_time': 0}
 
+        # Dump raw data into separate file to be post-processed for graphs after interpretation
+        summary = {}
+
         for key in total_dict:
             current_func = total_dict[key]
-            count = current_func['count']
-            ftype = ''
+            longest = current_func['longest']
 
             if key == 'save_files':
                 ftype = 'io'
-                io_time = current_func['io']
-                current_func['io_avg'] = io_time / count
-                agg['io_time'] += io_time
+                total = current_func['io']
+                current_func['io_avg'] = total / (num_processes*8)
+                agg['io_time'] += total
             else:  
                 ftype = 'total'
-                total_time = current_func['total']
-                current_func['total_avg'] = total_time/count
-                agg['total_time'] += total_time
+                total = current_func['total']
+                current_func['total_avg'] = total / num_processes
+                agg['total_time'] += total
 
-            line_string = 'Function: %s, Type: %s, Average: %f, Total: %f, Count: %d \n' % (key, ftype, current_func[ftype + '_avg'], total_time, count)
+            average_per_process = current_func[ftype + '_avg']
+            average_per_image = total/num_images # This metric doesn't mean much if there's more than 1 process
+            average_per_process_per_image = average_per_process/num_images
+
+            line_string = 'Function: %-25s, ' \
+                          'Type: %-15s, ' \
+                          'Average Per Process: %-10f, ' \
+                          'Average Per Image: %-10f,' \
+                          'Average PPPI: %-10f,' \
+                          'Longest: %-5f \n' \
+                          % (key, ftype,
+                             average_per_process,
+                             average_per_image,
+                             average_per_process_per_image,
+                             longest)
             file.write(line_string)
+
+            summary[key] = {'type': ftype,
+                            'APP': average_per_process,
+                            'API': average_per_image,
+                            'APPPI': average_per_process_per_image,
+                            'longest': longest}
 
         pIO = agg['io_time']/agg['total_time']*100
         pCompute = 100 - pIO
@@ -124,6 +163,10 @@ def aggregate_runtime_metrics(queue, filename):
         total_string = 'Percent Time Computing: %f, Percent Time Reading/Writing Files: %f\n' % (pCompute, pIO)
         file.write(total_string)
 
+        with open('runtime_metric_obj.json', 'a+') as obj_file:
+            # note: when using shell to access this data, use json.load
+            json.dump(summary, obj_file)
+            obj_file.write('\n') # so we can parse line by line later
 
 
 # ===================================================================================================================
@@ -178,9 +221,6 @@ def parallelize(num_items, num_processes, list_tuple, properties):
     # Properties contains data relevant to a particular openpiv function
 
     partitions = int(num_items/num_processes)
-
-    if num_items % num_processes != 0:
-        partitions += 1
 
     print "\n Partitions Size: %d" % partitions
 
@@ -545,9 +585,12 @@ def tif_to_npy(out_dir, prefix, file_list):
         file_read = io.imread(file_list[i])
         np.save(out_dir + prefix + "{:05}.npy".format(i), file_read)
 
+# ===================================================================================================================
+# SCRIPTING FUNCTIONS
+# ===================================================================================================================
 
-if __name__ == "__main__":
 
+def process_images(num_images, num_processes):
     # ===============================================================================
     # DEFINE PIV & DIRECTORY VARIABLES HERE
     # ===============================================================================
@@ -583,11 +626,6 @@ if __name__ == "__main__":
     # change pattern to your filename pattern
     imA_list = get_input_files(raw_dir, camera_zero_pattern)
     imB_list = get_input_files(raw_dir, camera_one_pattern)
-    num_images = len(imB_list)
-
-    # TODO: do some load testing to determine max # of processes before out of memory (for ~5GB image dataset)
-    num_processes = 20
-    num_images = 20  # Remove this if you want to process the entire image set
 
     # Pre-processing contrast
     contrast_properties = {"gpu_func": histogram_adjust, "out_dir": im_dir}
@@ -622,4 +660,147 @@ if __name__ == "__main__":
         }
     parallelize(num_images, num_processes, (u_list, v_list), routliers_properties)
 
-    aggregate_runtime_metrics(runtime_queue, 'runtime_metrics.txt')
+    aggregate_runtime_metrics(runtime_queue, num_images, num_processes, 'runtime_metrics.txt')
+
+
+'''
+Writes to 'runtime_metrics.txt'.
+Measures the runtime by varying number of images processed
+'''
+def test_with_image_set_length(set_length_list):
+    # Add line to queue to show which test
+    image_set_length_string = '\n\n\nResults from varying image set size: \n'
+    runtime_queue.put(image_set_length_string)
+
+    for el in set_length_list:
+        runtime_queue.put('\n***** Num Images: %-5f *****\n' % el)
+        process_images(el, 20)
+
+
+'''
+Writes to 'runtime_metrics.txt'.
+Measures the runtime by varying number of processes used
+'''
+def test_with_num_processes(number_processes_list):
+    # Add line to queue to show which test
+    num_processes_string = '\n\n\nResults from varying number of processes: \n'
+    runtime_queue.put(num_processes_string)
+
+    for el in number_processes_list:
+        runtime_queue.put('\n***** Num Processes: %-5f *****\n' % el)
+        process_images(100, el)
+
+
+'''
+Writes to 'runtime_metrics.txt'.
+Varies runtime by window size, takes the c
+'''
+def test_external_set(im_dir, set_name, file_pattern, window_sizes=(64, 32, 16, 8)):
+    dt = 5e-6
+    overlap = 0.50
+    coarse_factor = 2
+    nb_iter_max = 3
+    validation_iter = 1
+    x_scale = 7.45e-6  # m/pixel
+    y_scale = 7.41e-6  # m/pixel
+
+    out_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/output_data"
+    rep_dir = "/scratch/p/psulliva/chouvinc/maria_PIV_cont/replaced_data"
+
+    imA_list = get_input_files(im_dir, file_pattern[0])
+    imB_list = get_input_files(im_dir, file_pattern[1])
+
+    if file_pattern[0] == file_pattern[1]:
+        # same file pattern, means images are implictly pairs by index
+        del imA_list[1::2] # delete odd entries
+        del imB_list[0::2] # delete even entries
+
+    num_images = len(imB_list)
+
+    num_processes = 20
+
+    for min_window_size in window_sizes:
+        window_size_string  = '\n\n\nResults from %s set, with window size %d: \n' % (set_name, min_window_size)
+        runtime_queue.put(window_size_string)
+        # make output & replacement directory paths according to window size
+        out_dir += str(min_window_size) + "/"
+        rep_dir += str(min_window_size) + "/"
+
+        # Processing images
+        widim_properties = {"gpu_func": widim_gpu, "out_dir": out_dir, "dt": dt,
+                            "min_window_size": min_window_size, "overlap": overlap,
+                            "coarse_factor": coarse_factor, "nb_iter_max": nb_iter_max,
+                            "validation_iter": validation_iter, "x_scale": x_scale,
+                            "y_scale": y_scale}
+        parallelize(num_images, num_processes, (imA_list, imB_list), widim_properties)
+
+    aggregate_runtime_metrics(runtime_queue, num_images, num_processes, 'runtime_metrics.txt')
+
+
+def test_multi_correlation(image_sizes, window_sizes):
+    images = []
+
+    for size in image_sizes:
+        images.append(np.random.randn(size, size).astype(np.float32))
+
+    # Use object here (going to dump into json)
+    t = {}
+
+    for i in range(len(images)):
+        t_row = []
+        for j in range(len(window_sizes)):
+            start = time()
+            for k in range(10):
+                # Doing simple version of multiprocessing, since our class expects files and not np.arrays directly
+                process_list = []
+                p = Process(target=fake_process_images, args=(images, window_sizes, i, j, k%4))
+                p.start()
+                process_list.append(p)
+
+            # Cleanup
+            try:
+                for process in process_list:
+                    process.join()
+            except KeyboardInterrupt:
+                for process in process_list:
+                    process.terminate()
+                    process.join()
+            
+            print (time() - start)/50
+            t_row.append((time() - start)/50)
+    
+        t[str(image_sizes[i])] = t_row
+
+    with open('correlation.txt', 'a+') as file:
+        json.dump(t, file)
+
+
+def fake_process_images(images, window_sizes, i, j, gpuid):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpuid)
+
+    # Imports for testing performance (after setting device number)
+    from test_util.gpuFFT import fft_gpu
+    from test_util.IWarrange import IWarrange_gpu
+    
+    for x in range(5):
+        win_A, win_B = IWarrange_gpu(images[i], images[i], window_sizes[j], window_sizes[j] / 2)
+        corr_gpu = fft_gpu(win_A, win_B)
+
+def file_cleanup(file_names):
+    for s in file_names:
+        # Delete, regardless of extension (in case we have .csv, .xls, etc. in the future)
+        for f in glob.glob(s+'.*'):
+            os.remove(f)
+
+if __name__ == "__main__":
+    # Cleanup files from previous runs to keep files small (comment out to keep results after multiple runs)
+    file_names = []
+    file_cleanup(file_names)
+
+    # Run tests
+    #test_multi_correlation([512, 1024, 2048, 2560], [64, 32, 16, 8])
+    test_with_image_set_length([20, 30, 40, 50, 60, 70, 100])
+    test_with_num_processes([10, 20])
+
+    test_external_set('/scratch/p/psulliva/cdallas/2nd_PIV_challenge_data/Case_A/images/', 'challenge', ('A*a.npy', 'A*b.npy'))
+    test_external_set('/scratch/p/psulliva/cdallas/UQ_database/F001/images/', 'uncertainty', ('adj_*_data.txt', 'adj_*_data.txt'))
